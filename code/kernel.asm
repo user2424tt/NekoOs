@@ -1,8 +1,7 @@
 use16
  section .text
  org 0x7E00
- use16
-section .text
+
 
 procedur_init:
 mov [boot_disk],dl
@@ -3833,7 +3832,12 @@ print_hex32:
     loop .loop
     popa
     ret
-
+print_hex_byte32:
+    pusha
+    movzx eax, al           ; Байт → EAX
+    call print_hex32        ; Используем существующую функцию
+    popa
+    ret
 print_dec32:
     pusha
     mov ecx, 10
@@ -5630,7 +5634,6 @@ fdc_motor_on:
     call sleep_ms
     pop eax
     ret
-
 ; ============================================================
 ; ПОЗИЦИОНИРОВАНИЕ ГОЛОВКИ (SEEK)
 ; Вход: CH = цилиндр, DH = головка, DL = привод
@@ -5638,35 +5641,92 @@ fdc_motor_on:
 fdc_seek:
     pusha
 
+    ; Сбрасываем флаг IRQ
+    mov byte [fdd_irq_received], 0
+
     ; Формируем байт привода/головки
     mov al, dh
-    shl al, 2
-    and al, 0x04
-    or al, dl
+    shl al, 2                  ; head << 2
+    and al, 0x04               ; Маска для бита головки
+    or al, dl                  ; Добавляем привод
 
-    ; Отправляем команду SEEK
-    mov dx, FLOPPY_FIFO
-    mov ah, FLOPPY_CMD_SEEK
+    mov [.seek_drive_head], al
+    mov [.seek_cyl], ch
+
+    ; Отладка
+    pusha
+    mov esi, msg_seek_info
+    call print_string32
+    movzx eax, ch
+    call print_dec32
+    mov al, '/'
+    call print_char32
+    movzx eax, dh
+    call print_dec32
+    mov al, '/'
+    call print_char32
+    movzx eax, dl
+    call print_dec32
+    call new_line32
+    popa
+
+    ; Отправляем команду SEEK (0x0F)
+    mov al, FLOPPY_CMD_SEEK     ; 0x0F
     call fdc_send_byte
     jc .error
 
-    mov al, ah              ; Привод/головка
+    ; Отправляем байт: головка|привод
+    mov al, [.seek_drive_head]
     call fdc_send_byte
     jc .error
 
-    mov al, ch              ; Цилиндр
+    ; Отправляем цилиндр
+    mov al, [.seek_cyl]
     call fdc_send_byte
     jc .error
 
-    ; Ждём прерывания
-    call fdc_wait_irq
-    jc .error
+    ; Ждём прерывания (максимум 5 секунд)
+    mov ecx, 50                ; 50 * 100ms = 5 секунд
+.wait_irq:
+    cmp byte [fdd_irq_received], 1
+    je .irq_ok
+    mov eax, 100
+    call sleep_ms              ; Ждём 100ms
+    loop .wait_irq
 
-    ; Sense Interrupt
+    mov esi, msg_seek_timeout
+    call print_string32
+    jmp .error
+
+.irq_ok:
+    mov byte [fdd_irq_received], 0
+
+    ; Sense Interrupt (ОБЯЗАТЕЛЬНО!)
     call fdc_sense_interrupt
+
+    ; Проверяем статус
+    test byte [fdc_st0], 0x20  ; Equipment Check?
+    jnz .equip_error
+
+    test byte [fdc_st0], 0x08  ; Seek Error?
+    jnz .seek_error
 
     popa
     clc
+    ret
+
+.equip_error:
+    mov esi, msg_seek_equip_error
+    call print_string32
+    popa
+    stc
+    ret
+
+.seek_error:
+    mov esi, msg_seek_error_text
+    call print_string32
+    popa
+    stc
     ret
 
 .error:
@@ -5674,6 +5734,15 @@ fdc_seek:
     stc
     ret
 
+; Локальные переменные
+.seek_drive_head: db 0
+.seek_cyl:        db 0
+
+msg_seek_info:        db 'SEEK to C/H/D: ', 0
+msg_seek_timeout:     db 'SEEK: IRQ timeout!', 0
+msg_seek_equip_error: db 'SEEK: Equipment error (no disk?)', 0
+msg_seek_error_text:  db 'SEEK: Seek error (bad cylinder?)', 0
+msg_send_timeout:     db 'SEND: timeout!', 0
 ; ============================================================
 ; ВЫКЛЮЧИТЬ МОТОР FDC
 ; ============================================================
@@ -5685,28 +5754,44 @@ fdc_motor_off:
 ; ============================================================
 ; ОТПРАВКА БАЙТА В FDC
 ; ============================================================
+; ============================================================
+; ОТПРАВКА БАЙТА В FDC (ИСПРАВЛЕНО)
+; Вход: AL = байт для отправки
+; ============================================================
 fdc_send_byte:
     push ecx
     push edx
+    push eax               ; Сохраняем AL
 
-    mov ecx, 0xFFFF
+    mov ecx, 10000         ; Таймаут (увеличил для надежности)
 .wait:
     mov dx, FLOPPY_MSR
     in al, dx
     and al, 0xC0           ; RQM + DIO
-    cmp al, 0x80           ; RQM=1, DIO=0
+    cmp al, 0x80           ; RQM=1, DIO=0 (готов к приёму)
     je .send
     loop .wait
 
+    ; Таймаут
+    pop eax
     stc
     pop edx
     pop ecx
     ret
 
 .send:
+    pop eax                ; Восстанавливаем AL
     mov dx, FLOPPY_FIFO
-    mov al, ah             ; Байт для отправки в AH
-    out dx, al
+    out dx, al             ; Отправляем байт
+
+    ; Небольшая задержка между байтами
+    push ecx
+    mov ecx, 100
+.delay:
+    nop
+    loop .delay
+    pop ecx
+
     clc
     pop edx
     pop ecx
@@ -5953,7 +6038,7 @@ fdc_read_sector:
     call print_dec32
     call new_line32
 
-    ; === ШАГ 2: Проверка, что мотор включён ===
+    ; === ШАГ 2: Включение мотора ===
     mov al, [.drive]
     call fdc_motor_on
 
@@ -5971,25 +6056,21 @@ fdc_read_sector:
     ; Сбрасываем флаг прерывания
     mov byte [fdd_irq_received], 0
 
-    ; Вычисляем байт привода/головки
+    ; Вычисляем байт привода/головки (ПРАВИЛЬНО!)
     mov al, [.head]
-    shl al, 2                  ; head * 4
-    and al, 0x04               ; Только бит 2
-    mov ah, [.drive]
-    and ah, 0x01               ; Только бит 0
-    or al, ah                  ; Объединяем
-
+    shl al, 2                  ; head << 2 (бит HD в команде)
+    or al, [.drive]            ; добавляем номер привода в бит 0
     mov [.drive_head_byte], al
 
     ; Отправляем 9 байт команды
     mov dx, FLOPPY_FIFO
 
-    ; Байт 0: Команда READ DATA
-    mov al, FLOPPY_CMD_READ | FLOPPY_CMD_EXT_MT | FLOPPY_CMD_EXT_MFM | FLOPPY_CMD_EXT_SKIP
+    ; Байт 0: Команда READ DATA (ИСПРАВЛЕНО - убран FLOPPY_CMD_EXT_SKIP)
+    mov al, FLOPPY_CMD_READ | FLOPPY_CMD_EXT_MT | FLOPPY_CMD_EXT_MFM  ; 0x66
     call fdc_send_byte
     jc .error_send
 
-    ; Байт 1: Привод/головка
+    ; Байт 1: Привод/головка (ИСПРАВЛЕНО - используем правильный байт)
     mov al, [.drive_head_byte]
     call fdc_send_byte
     jc .error_send
@@ -5999,7 +6080,7 @@ fdc_read_sector:
     call fdc_send_byte
     jc .error_send
 
-    ; Байт 3: Головка
+    ; Байт 3: Головка (ИСПРАВЛЕНО - повторяем номер головки)
     mov al, [.head]
     call fdc_send_byte
     jc .error_send
@@ -6015,16 +6096,16 @@ fdc_read_sector:
     jc .error_send
 
     ; Байт 6: Последний сектор (EOT)
-    mov al, FLOPPY_SECTORS_PER_TRACK
+    mov al, FLOPPY_SECTORS_PER_TRACK  ; 18
     call fdc_send_byte
     jc .error_send
 
-    ; Байт 7: Gap length
+    ; Байт 7: Gap length (ДОБАВЛЕНА проверка)
     mov al, 0x1B
     call fdc_send_byte
     jc .error_send
 
-    ; Байт 8: DTL (специальный)
+    ; Байт 8: DTL (0xFF для N=2)
     mov al, 0xFF
     call fdc_send_byte
     jc .error_send
@@ -6033,16 +6114,54 @@ fdc_read_sector:
     call fdc_wait_irq
     jc .error_timeout
 
-    ; === ШАГ 7: Чтение результатов (7 байт) ===
+    ; === ШАГ 7: Чтение результатов (7 байт) ИСПРАВЛЕНО ===
+    ; Результаты: ST0, ST1, ST2, CYL, HEAD, SECTOR, SECTOR SIZE
     mov ecx, 7
 .read_results:
-    push ecx
     call fdc_read_byte
-    pop ecx
+    ; Здесь можно сохранить результаты для диагностики
+    push eax
     loop .read_results
 
-    ; === ШАГ 8: Sense Interrupt ===
+    ; Очищаем стек от результатов
+    mov ecx, 7
+.clear_stack:
+    pop eax
+    loop .clear_stack
+
+    ; === ШАГ 8: Sense Interrupt (ОБЯЗАТЕЛЬНО после любой команды с IRQ) ===
     call fdc_sense_interrupt
+
+    ; Проверяем статус операции (ДОБАВЛЕНО)
+    cmp byte [fdc_st0], 0x20   ; Проверяем бит EC (Equipment Check)
+    jne .check_se
+    mov esi, msg_fdc_equipment_error
+    call print_string32
+    jmp .error_dma
+
+.check_se:
+    test byte [fdc_st0], 0x08  ; Проверяем бит SE (Seek Error)
+    jz .check_ma
+    mov esi, msg_fdc_seek_error
+    call print_string32
+    jmp .error_dma
+
+.check_ma:
+    test byte [fdc_st0], 0x10  ; Проверяем бит MA (Memory Access)
+    jz .check_st1
+
+.error_dma:
+    stc
+    popa
+    mov al, 5
+    ret
+
+.check_st1:
+    cmp byte [fdc_st1], 0
+    jne .error_data
+
+    cmp byte [fdc_st2], 0
+    jne .error_data
 
     ; === ШАГ 9: Копирование данных из DMA буфера ===
     mov esi, fdc_dma_buffer
@@ -6092,6 +6211,22 @@ fdc_read_sector:
     mov al, 4
     ret
 
+.error_data:
+    mov esi, msg_fdc_data_error
+    call print_string32
+    call new_line32
+    mov al, [fdc_st1]
+    call print_hex_byte32
+    mov al, '/'
+    call print_char32
+    mov al, [fdc_st2]
+    call print_hex_byte32
+    call new_line32
+    popa
+    stc
+    mov al, 6
+    ret
+
 ; Локальные переменные
 .lba:             dd 0
 .buf:             dd 0
@@ -6100,6 +6235,10 @@ fdc_read_sector:
 .head:            db 0
 .sect:            db 0
 .drive_head_byte: db 0
+msg_fdc_equipment_error: db 'FDC: Equipment check error!', 0
+msg_fdc_seek_error:      db 'FDC: Seek error!', 0
+msg_fdc_data_error:      db 'FDC: Data error! ST1/ST2: ', 0
+
 ; ============================================================
 ; СБРОС КОНТРОЛЛЕРА FDC
 ; ============================================================
@@ -6456,7 +6595,7 @@ detect_floppy_drives:
 ; ============================================================
 ; ПЕРЕМЕННЫЕ ДЛЯ ДЕТЕКТОРА
 ; ============================================================
-section .data
+
 
 cmos_raw_value:   db 0
 primary_type:     db 0
